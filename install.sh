@@ -146,11 +146,19 @@ except Exception: print("")' "$json")
 mapfile -t L < <(python3 - "$json" <<'PY'
 import json, sys
 a = json.loads(sys.argv[1]); r = a.get("registry") or {}
-for v in (a["status"], a.get("message") or "", a.get("yourIp") or "", r.get("user", ""), r.get("token", "")):
+for v in (a["status"], a.get("message") or "", a.get("yourIp") or "", r.get("user", ""), r.get("token", ""),
+          a.get("channel") or "live", a.get("manifestUrl") or "", a.get("domain") or "", a.get("operatorEmail") or ""):
     print(v)
 PY
 )
 L_STATUS="${L[0]:-}"; L_MESSAGE="${L[1]:-}"; L_IP="${L[2]:-}"; L_USER="${L[3]:-}"; L_TOKEN="${L[4]:-}"
+# Which releases this server follows (staging: every release, installed by
+# itself; live: what Yaxxa released to live), and, for a staging server, its
+# address and operator: the command then asks nothing.
+L_CHANNEL="${L[5]:-live}"; L_MANIFEST="${L[6]:-}"; L_DOMAIN="${L[7]:-}"; L_EMAIL="${L[8]:-}"
+[ -z "$L_MANIFEST" ] || LATEST_URL="$L_MANIFEST"
+UCEO_DOMAIN="${UCEO_DOMAIN:-$L_DOMAIN}"
+UCEO_ADMIN_EMAIL="${UCEO_ADMIN_EMAIL:-$L_EMAIL}"
 [ "$L_STATUS" = ACTIVE ] || die "this install code is ${L_STATUS,,}${L_MESSAGE:+: $L_MESSAGE}"
 [ -n "$L_TOKEN" ] || die "Yaxxa sent no download credentials. Tell Yaxxa: the release registry is not set up."
 
@@ -169,12 +177,16 @@ if [ "$INSTALLED" = 0 ]; then
   # Keycloak's own administration: from where this install is being run, and
   # the server itself. More networks can be added to .env later.
   ssh_ip="${SSH_CLIENT%% *}"
-  UCEO_ADMIN_CIDRS="${UCEO_ADMIN_CIDRS:-${ssh_ip:+$ssh_ip/32,}127.0.0.1/32}"
+  # Space-separated, as the web proxy reads them (a comma is not a separator there).
+  UCEO_ADMIN_CIDRS="${UCEO_ADMIN_CIDRS:-${ssh_ip:+$ssh_ip/32 }127.0.0.1/32}"
+  UCEO_ADMIN_CIDRS="${UCEO_ADMIN_CIDRS//,/ }"
 fi
 echo "Installing for $UCEO_ADMIN_EMAIL at https://$UCEO_DOMAIN (this server: $UCEO_PUBLIC_IP)."
 
 # The certificate is issued for the domain only if it points here.
-dns_ip=$(getent ahostsv4 "$UCEO_DOMAIN" | awk 'NR==1 {print $1}')
+# Not found yet (a new record, or a resolver still remembering it was not
+# there) is said below, not a silent stop.
+dns_ip=$(getent ahostsv4 "$UCEO_DOMAIN" | awk 'NR==1 {print $1}' || true)
 [ "$dns_ip" = "$UCEO_PUBLIC_IP" ] || die "$UCEO_DOMAIN points to ${dns_ip:-nothing}, not to $UCEO_PUBLIC_IP. Add a DNS A record for it and run this again — or leave out --domain to start on ${UCEO_PUBLIC_IP//./-}.sslip.io."
 
 # --- 2. Docker ----------------------------------------------------------------
@@ -249,9 +261,12 @@ LOG_LEVEL=info
 DEPLOYMENT_TOPOLOGY=single-node
 
 PUBLIC_HOSTNAME=$UCEO_DOMAIN
-ADMIN_ALLOWED_CIDRS=$UCEO_ADMIN_CIDRS
+ADMIN_ALLOWED_CIDRS="$UCEO_ADMIN_CIDRS"
 VOICE_PUBLIC_IP=$UCEO_PUBLIC_IP
 EDGE_PUBLIC_IP=$UCEO_PUBLIC_IP
+# Call audio ports, both media nodes together (the firewall lets these in).
+RTP_START_PORT=16384
+RTP_END_PORT=32767
 
 POSTGRES_DB=uceo
 POSTGRES_USER=uceo
@@ -285,7 +300,8 @@ CORS_ORIGINS=https://$UCEO_DOMAIN
 ESL_HOST=127.0.0.1
 ESL_PORT=8021
 ESL_PASSWORD=$(secret)
-FREESWITCH_NODES=fs1=127.0.0.1:8021;sip=127.0.0.1:5080;webrtc,fs2=127.0.0.1:8022;sip=127.0.0.1:5082
+# FREESWITCH_NODES: the compose files' default (both media nodes here). Not
+# written: its semicolons would end the line when this file is read back.
 OPENSIPS_MI=127.0.0.1:8888
 INTEGRATION_SECRET_KEY=$(openssl rand -hex 32)
 
@@ -313,6 +329,9 @@ UCEO_VERSION=$VERSION
 UCEO_RELEASE_MANIFEST_URL=$LATEST_URL
 UCEO_INSTALL_CODE=$UCEO_INSTALL_CODE
 UCEO_LICENCE_URL=$LICENCE_URL
+# staging: Yaxxa's staging server (a banner says so; every release installs itself).
+UCEO_ENVIRONMENT=$([ "$L_CHANNEL" = staging ] && echo staging || echo production)
+UCEO_AUTO_UPDATE=$([ "$L_CHANNEL" = staging ] && echo 1 || echo 0)
 EOF
   chmod 600 "$ENV"
 fi
@@ -320,6 +339,11 @@ set -a; . "$ENV"; set +a
 
 # --- 5. Start ----------------------------------------------------------------
 BASE=(docker compose -p uceo -f "$DIR/infrastructure/compose/docker-compose.yml" --env-file "$ENV")
+# A server of a pair (ADR-0011) runs its database under Patroni: never start
+# it without that layer, or the copy would run on its own.
+HA_ENV="${UCEO_STATE_DIR:-/var/lib/uceo}/ha.env"
+[ -f "$HA_ENV" ] && BASE=(docker compose -p uceo -f "$DIR/infrastructure/compose/docker-compose.yml" \
+  -f "$DIR/infrastructure/compose/docker-compose.ha.yml" --env-file "$ENV" --env-file "$HA_ENV")
 APP=(docker compose -p uceo-app -f "$DIR/infrastructure/compose/docker-compose.app.yml" --env-file "$ENV")
 
 log "starting the core services (database, storage, sign-in, voice)"
@@ -377,7 +401,11 @@ fi
 log "installing updates, licence renewal, nightly media restart and backups"
 cp "$DIR"/infrastructure/host/uceo-*.service "$DIR"/infrastructure/host/uceo-*.timer /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now uceo-update-agent.timer uceo-licence.timer >/dev/null 2>&1 || true
+# One at a time: a unit a release does not have must not keep the others off.
+for unit in uceo-update-agent.timer uceo-licence.timer uceo-host-agent.service; do
+  [ -f "/etc/systemd/system/$unit" ] || continue
+  systemctl enable --now "$unit" >/dev/null 2>&1 || echo "Note: $unit did not start; see 'systemctl status $unit'."
+done
 cat > /etc/cron.d/uceo <<EOF
 # Yaxxa Engagement Orchestrator (installer). Times are the server's zone.
 SHELL=/bin/bash
@@ -392,7 +420,7 @@ chmod 644 /etc/cron.d/uceo
 # --- 8. The firewall, and from the outside -------------------------------------
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
   log "opening the platform's ports in the firewall (ufw)"
-  for rule in 80/tcp 443/tcp 5060/udp 5060/tcp 16384:16783/udp; do ufw allow "$rule" >/dev/null; done
+  for rule in 80/tcp 443/tcp 5060/udp 5060/tcp 16384:32767/udp; do ufw allow "$rule" >/dev/null; done
 fi
 log "checking https://$PUBLIC_HOSTNAME"
 ok=0
@@ -417,7 +445,7 @@ echo "  Settings:  $ENV (root only — keep a copy somewhere safe)"
 echo "  Updates:   Platform → Updates in the console, or: sudo $DIR/scripts/uceo-update.sh"
 echo
 echo "  Behind a cloud firewall (AWS, Azure, Google…)? Open there: 80 and 443 TCP (web),"
-echo "  5060 UDP/TCP (SIP from your carrier) and 16384-16783 UDP (call audio)."
+echo "  5060 UDP/TCP (SIP from your carrier) and 16384-32767 UDP (call audio)."
 case "$PUBLIC_HOSTNAME" in *.sslip.io)
   echo
   echo "  This address works now. To use your own domain later: point it at $UCEO_PUBLIC_IP,"
