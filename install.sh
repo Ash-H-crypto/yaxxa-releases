@@ -338,6 +338,8 @@ fi
 set -a; . "$ENV"; set +a
 
 # --- 5. Start ----------------------------------------------------------------
+# The built-in hold music, fetched once (never fails the install).
+"$DIR/scripts/uceo-hold-music.sh" || true
 BASE=(docker compose -p uceo -f "$DIR/infrastructure/compose/docker-compose.yml" --env-file "$ENV")
 # A server of a pair (ADR-0011) runs its database under Patroni: never start
 # it without that layer, or the copy would run on its own.
