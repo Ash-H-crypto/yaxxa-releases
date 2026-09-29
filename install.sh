@@ -292,6 +292,9 @@ KEYCLOAK_DB_PASSWORD=$(secret)
 KEYCLOAK_COMMAND=start
 KEYCLOAK_HOSTNAME=https://$UCEO_DOMAIN/auth
 KEYCLOAK_INTERNAL_URL=
+# Other https addresses the platform's web apps are served from, comma-separated
+# (the Yaxxa AI PBX console's, ADR-0017). Optional; empty: none.
+KEYCLOAK_EXTRA_WEB_BASES=
 OIDC_ISSUER_URL=https://$UCEO_DOMAIN/auth/realms/uceo
 OIDC_AUDIENCE=uceo-api
 OIDC_WEB_CLIENT_ID=uceo-web
@@ -332,6 +335,11 @@ UCEO_LICENCE_URL=$LICENCE_URL
 # staging: Yaxxa's staging server (a banner says so; every release installs itself).
 UCEO_ENVIRONMENT=$([ "$L_CHANNEL" = staging ] && echo staging || echo production)
 UCEO_AUTO_UPDATE=$([ "$L_CHANNEL" = staging ] && echo 1 || echo 0)
+
+# The Yaxxa AI PBX's Phone system console (an https origin; the console is at
+# /phone/ there): the app switcher offers it, and people whose role is only the
+# phone system go straight to it. Optional; empty: no Phone system anywhere.
+AIPBX_URL=
 EOF
   chmod 600 "$ENV"
 fi
@@ -368,6 +376,7 @@ kc() { # script [extra docker run flags...]
     -e KEYCLOAK_URL=http://127.0.0.1:8080/auth -e KEYCLOAK_ADMIN -e KEYCLOAK_ADMIN_PASSWORD \
     -e PUBLIC_BASE_URL="https://$PUBLIC_HOSTNAME" -e OIDC_AUDIENCE \
     -e GOOGLE_CLIENT_ID -e GOOGLE_CLIENT_SECRET -e MICROSOFT_CLIENT_ID -e MICROSOFT_CLIENT_SECRET \
+    -e KEYCLOAK_EXTRA_WEB_BASES \
     "$@" "$UCEO_IMAGE_PREFIX/migrate:$UCEO_VERSION" node "keycloak/$script"
 }
 log "setting up sign-in"
