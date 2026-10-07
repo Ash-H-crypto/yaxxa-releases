@@ -356,6 +356,16 @@ HA_ENV="${UCEO_STATE_DIR:-/var/lib/uceo}/ha.env"
   -f "$DIR/infrastructure/compose/docker-compose.ha.yml" --env-file "$ENV" --env-file "$HA_ENV")
 APP=(docker compose -p uceo-app -f "$DIR/infrastructure/compose/docker-compose.app.yml" --env-file "$ENV")
 
+# Run again on a server that is already installed, this recreates its
+# containers: a planned-maintenance window (2026-10-05) holds Platform →
+# Servers' "services not running" email meanwhile, and is closed once the
+# platform is ready. A first install has nothing to hold (and no token yet).
+quiet() {
+  [ "$INSTALLED" = 1 ] && [ -f "$DIR/scripts/ops/quiet-window.sh" ] || return 0
+  bash "$DIR/scripts/ops/quiet-window.sh" "$@" 2>&1 | sed 's/^/quiet window: /' || true
+}
+quiet 30 "Installing again"
+
 log "starting the core services (database, storage, sign-in, voice)"
 "${BASE[@]}" up -d --no-build --wait >/dev/null 2>&1 || "${BASE[@]}" up -d --no-build \
   || die "the core services did not start: see '${BASE[*]} ps'"
@@ -390,6 +400,7 @@ for _ in $(seq 1 60); do
 done
 curl -fsS --max-time 3 http://127.0.0.1:3000/api/v1/health/ready >/dev/null 2>&1 \
   || die "the platform did not become ready within five minutes: see '${APP[*]} logs api'"
+quiet 0
 
 log "storing the licence"
 "$DIR/scripts/uceo-licence.sh" >/dev/null || die "the licence could not be stored"
