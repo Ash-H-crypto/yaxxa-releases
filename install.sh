@@ -52,6 +52,9 @@ while [ $# -gt 0 ]; do
     --email) UCEO_ADMIN_EMAIL="${2:-}"; shift ;;
     --domain) UCEO_DOMAIN="${2:-}"; shift ;;
     --version) UCEO_VERSION_WANTED="${2:-}"; shift ;;
+    # Where licences come from (ADR-0048): the centre's address, given in
+    # the command Platform → Installs shows when it is not the default.
+    --licence-url) ARG_LICENCE_URL="${2:-}"; shift ;;
     *) echo "unknown option: $1" >&2; exit 64 ;;
   esac
   shift
@@ -123,6 +126,8 @@ else
   done
   [ -z "$busy" ] || die "these ports are already in use:$busy (another web server, SIP server or database?)"
 fi
+# Given in the command, the centre's address wins over what .env said.
+[ -z "${ARG_LICENCE_URL:-}" ] || LICENCE_URL="${ARG_LICENCE_URL%/}"
 # This server's own identity, which the install code is bound to. Kept for
 # ever once made, so reinstalling on the same server is not "another server".
 mkdir -p /var/lib/uceo
