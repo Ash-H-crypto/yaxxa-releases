@@ -32,7 +32,9 @@
 #   8. opens the server's firewall (ufw) for the platform if it is on, and checks the
 #      platform answers on its own address.
 #
-# Running it again on an installed server keeps its .env and secrets.
+# Running it again on an installed server keeps its .env and secrets, and the
+# release it runs (a newer one is installed with uceo-update.sh); it never
+# recreates the switches or the SIP edge, so calls carry on.
 set -euo pipefail
 umask 077
 
@@ -126,6 +128,14 @@ else
   done
   [ -z "$busy" ] || die "these ports are already in use:$busy (another web server, SIP server or database?)"
 fi
+# Run again on an installed server: never beside an update (uceo-update.sh
+# holds the same lock), which would switch the release under this run.
+if [ "$INSTALLED" = 1 ]; then
+  UPDATE_LOCK="${UCEO_UPDATE_LOCK:-/var/lib/uceo/update.lock}"
+  mkdir -p "$(dirname "$UPDATE_LOCK")"
+  exec 9>"$UPDATE_LOCK"
+  flock -n 9 || die "an update is running on this server; run this again once it has finished"
+fi
 # Given in the command, the centre's address wins over what .env said.
 [ -z "${ARG_LICENCE_URL:-}" ] || LICENCE_URL="${ARG_LICENCE_URL%/}"
 # This server's own identity, which the install code is bound to. Kept for
@@ -139,7 +149,8 @@ ask UCEO_INSTALL_CODE "Install code (from Yaxxa)"
 log "checking the install code with Yaxxa"
 body=$(python3 -c 'import json,sys; print(json.dumps({"code": sys.argv[1], "serverId": sys.argv[2], "hostname": sys.argv[3], "credentials": True}))' \
   "$UCEO_INSTALL_CODE" "$SERVER_ID" "$(hostname -f 2>/dev/null || hostname)")
-answer=$(curl -sS --max-time 30 -w '\n%{http_code}' -H 'content-type: application/json' -d "$body" \
+# The body (it holds the install code) on standard input, never the command line.
+answer=$(printf '%s' "$body" | curl -sS --max-time 30 -w '\n%{http_code}' -H 'content-type: application/json' --data-binary @- \
   "${LICENCE_URL%/}/api/v1/licence/check") || die "could not reach Yaxxa at $LICENCE_URL: this server needs internet access to install"
 http="${answer##*$'\n'}"; json="${answer%$'\n'*}"
 reason=$(python3 -c 'import json,sys
@@ -195,6 +206,27 @@ dns_ip=$(getent ahostsv4 "$UCEO_DOMAIN" | awk 'NR==1 {print $1}' || true)
 [ "$dns_ip" = "$UCEO_PUBLIC_IP" ] || die "$UCEO_DOMAIN points to ${dns_ip:-nothing}, not to $UCEO_PUBLIC_IP. Add a DNS A record for it and run this again — or leave out --domain to start on ${UCEO_PUBLIC_IP//./-}.sslip.io."
 
 # --- 2. Docker ----------------------------------------------------------------
+# Container logs kept to 5 files of 20 MB each (the default json-file grows
+# without limit). Merged into what daemon.json already says (uceo-join.sh
+# edits it too); a log driver already chosen there is kept. Docker reads it
+# when it starts: a new install starts with it; an installed server is not
+# restarted for it, and containers take it as they are created after Docker
+# next starts.
+mkdir -p /etc/docker
+python3 - <<'PY'
+import json, os, sys
+p = "/etc/docker/daemon.json"
+try:
+    d = json.load(open(p)) if os.path.exists(p) else {}
+except ValueError:
+    print(f"Note: {p} is not valid JSON; container log limits not set.")
+    sys.exit(0)
+if "log-driver" not in d:
+    d["log-driver"] = "local"
+    d.setdefault("log-opts", {"max-size": "20m", "max-file": "5"})
+json.dump(d, open(p, "w"), indent=2)
+PY
+chmod 644 /etc/docker/daemon.json
 if ! command -v docker >/dev/null || ! docker compose version >/dev/null 2>&1; then
   # From Docker's own repository, as on Yaxxa's servers: the distributions'
   # packages lag behind and name the compose plugin differently.
@@ -216,8 +248,21 @@ docker info >/dev/null 2>&1 || die "Docker is installed but not running"
 
 # --- 3. The release -----------------------------------------------------------
 WORK=$(mktemp -d)
-MANIFEST_URL="$LATEST_URL"
-[ -z "${UCEO_VERSION_WANTED:-}" ] || MANIFEST_URL="${LATEST_URL%/*}/versions/$UCEO_VERSION_WANTED.json"
+# Run again on an installed server (a new domain), the release it runs: the
+# latest would mix two releases (its new scripts and settings beside the
+# running services), and only uceo-update.sh replaces services without a gap.
+pick_release() {
+  if [ "$INSTALLED" = 1 ]; then
+    [[ "${UCEO_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] \
+      || die "this server runs ${UCEO_VERSION:-no release}, not a release: the installer only reinstalls the release a server runs"
+    [ -z "${UCEO_VERSION_WANTED:-}" ] || [ "$UCEO_VERSION_WANTED" = "$UCEO_VERSION" ] \
+      || die "this server runs $UCEO_VERSION: install $UCEO_VERSION_WANTED with $DIR/scripts/uceo-update.sh $UCEO_VERSION_WANTED"
+    UCEO_VERSION_WANTED="$UCEO_VERSION"
+  fi
+  MANIFEST_URL="$LATEST_URL"
+  [ -z "${UCEO_VERSION_WANTED:-}" ] || MANIFEST_URL="${LATEST_URL%/*}/versions/$UCEO_VERSION_WANTED.json"
+}
+pick_release
 log "fetching the release"
 curl -fsSL --max-time 30 "$MANIFEST_URL" -o "$WORK/manifest.json" || die "could not fetch the release manifest from $MANIFEST_URL"
 printf '%s\n' "$RELEASE_KEY" > "$WORK/key.pem"
@@ -295,6 +340,10 @@ KEYCLOAK_ADMIN=admin
 KEYCLOAK_ADMIN_PASSWORD=$(secret)
 KEYCLOAK_DB_PASSWORD=$(secret)
 KEYCLOAK_COMMAND=start
+# Sign-in's share of this server: half its cores, so a sign-in storm leaves
+# the rest to calls, the API and the database (all of them, on a server that
+# only signs people in).
+KEYCLOAK_CPUS=$(( cpus / 2 > 0 ? cpus / 2 : 1 ))
 KEYCLOAK_HOSTNAME=https://$UCEO_DOMAIN/auth
 KEYCLOAK_INTERNAL_URL=
 # Other https addresses the platform's web apps are served from, comma-separated
@@ -353,6 +402,11 @@ set -a; . "$ENV"; set +a
 # --- 5. Start ----------------------------------------------------------------
 # The built-in hold music, fetched once (never fails the install).
 "$DIR/scripts/uceo-hold-music.sh" || true
+# Kernel limits for many calls and connections (readiness, ADR-0051), before
+# anything opens its sockets. Short of them the platform still runs.
+log "setting the kernel limits (/etc/sysctl.d/90-uceo.conf)"
+bash "$DIR/scripts/uceo-host-agent.sh" host-limits \
+  || echo "Note: the kernel limits were not all set; Platform → Servers shows which, with the fix."
 BASE=(docker compose -p uceo -f "$DIR/infrastructure/compose/docker-compose.yml" --env-file "$ENV")
 # A server of a pair (ADR-0011) runs its database under Patroni: never start
 # it without that layer, or the copy would run on its own.
@@ -371,9 +425,18 @@ quiet() {
 }
 quiet 30 "Installing again"
 
+# The core services. Run again on an installed server, only those not
+# running are started: none of them follows the domain (the application and
+# its web proxy do, below), and recreating a switch or the SIP edge would
+# drop every call on it.
+core_up() {
+  local keep=()
+  [ "$INSTALLED" = 1 ] && keep=(--no-recreate)
+  "${BASE[@]}" up -d --no-build ${keep[@]+"${keep[@]}"} --wait >/dev/null 2>&1 \
+    || "${BASE[@]}" up -d --no-build ${keep[@]+"${keep[@]}"}
+}
 log "starting the core services (database, storage, sign-in, voice)"
-"${BASE[@]}" up -d --no-build --wait >/dev/null 2>&1 || "${BASE[@]}" up -d --no-build \
-  || die "the core services did not start: see '${BASE[*]} ps'"
+core_up || die "the core services did not start: see '${BASE[*]} ps'"
 if [ -x "$DIR/infrastructure/freeswitch/scripts/ensure-wss-cert.sh" ]; then
   "$DIR/infrastructure/freeswitch/scripts/ensure-wss-cert.sh" >/dev/null 2>&1 || true
 fi
@@ -425,11 +488,11 @@ if [ "$INSTALLED" = 0 ]; then
 fi
 
 # --- 7. Keeping it running ----------------------------------------------------
-log "installing updates, licence renewal, nightly media restart and backups"
+log "installing updates, licence renewal, nightly media restart, backups and the weekly restore test"
 cp "$DIR"/infrastructure/host/uceo-*.service "$DIR"/infrastructure/host/uceo-*.timer /etc/systemd/system/
 systemctl daemon-reload
 # One at a time: a unit a release does not have must not keep the others off.
-for unit in uceo-update-agent.timer uceo-licence.timer uceo-host-agent.service; do
+for unit in uceo-update-agent.timer uceo-licence.timer uceo-host-agent.service uceo-restore-test.timer; do
   [ -f "/etc/systemd/system/$unit" ] || continue
   systemctl enable --now "$unit" >/dev/null 2>&1 || echo "Note: $unit did not start; see 'systemctl status $unit'."
 done
