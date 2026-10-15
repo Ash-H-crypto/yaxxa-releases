@@ -15,6 +15,12 @@
 #
 # (--version X.Y.Z installs a particular release instead of the latest.)
 #
+# A domain behind a proxy (Cloudflare's orange cloud) points at the proxy,
+# not at this server: add --behind-proxy (or UCEO_BEHIND_PROXY=1) and the
+# check that it points here is skipped. The certificate is still issued over
+# HTTP on port 80, so the proxy must pass port 80 through (with Cloudflare:
+# "Always Use HTTPS" off).
+#
 # An install code is for one server. The first install binds it to this
 # server; another server with the same code is refused. Yaxxa can release it
 # for a replacement server.
@@ -54,6 +60,7 @@ while [ $# -gt 0 ]; do
     --email) UCEO_ADMIN_EMAIL="${2:-}"; shift ;;
     --domain) UCEO_DOMAIN="${2:-}"; shift ;;
     --version) UCEO_VERSION_WANTED="${2:-}"; shift ;;
+    --behind-proxy) UCEO_BEHIND_PROXY=1 ;;
     # Where licences come from (ADR-0048): the centre's address, given in
     # the command Platform → Installs shows when it is not the default.
     --licence-url) ARG_LICENCE_URL="${2:-}"; shift ;;
@@ -192,7 +199,8 @@ if [ "$INSTALLED" = 0 ]; then
   [[ "$UCEO_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$ ]] || die "\"$UCEO_DOMAIN\" is not a domain name"
   # Keycloak's own administration: from where this install is being run, and
   # the server itself. More networks can be added to .env later.
-  ssh_ip="${SSH_CLIENT%% *}"
+  # Not set under sudo, which drops it: then the server itself only.
+  ssh_ip="${SSH_CLIENT:-}"; ssh_ip="${ssh_ip%% *}"
   # Space-separated, as the web proxy reads them (a comma is not a separator there).
   UCEO_ADMIN_CIDRS="${UCEO_ADMIN_CIDRS:-${ssh_ip:+$ssh_ip/32 }127.0.0.1/32}"
   UCEO_ADMIN_CIDRS="${UCEO_ADMIN_CIDRS//,/ }"
@@ -202,8 +210,18 @@ echo "Installing for $UCEO_ADMIN_EMAIL at https://$UCEO_DOMAIN (this server: $UC
 # The certificate is issued for the domain only if it points here.
 # Not found yet (a new record, or a resolver still remembering it was not
 # there) is said below, not a silent stop.
-dns_ip=$(getent ahostsv4 "$UCEO_DOMAIN" | awk 'NR==1 {print $1}' || true)
-[ "$dns_ip" = "$UCEO_PUBLIC_IP" ] || die "$UCEO_DOMAIN points to ${dns_ip:-nothing}, not to $UCEO_PUBLIC_IP. Add a DNS A record for it and run this again — or leave out --domain to start on ${UCEO_PUBLIC_IP//./-}.sslip.io."
+# Behind a proxy it points at the proxy instead: said, not refused.
+check_dns() {
+  local dns_ip
+  dns_ip=$(getent ahostsv4 "$UCEO_DOMAIN" | awk 'NR==1 {print $1}' || true)
+  [ "$dns_ip" = "$UCEO_PUBLIC_IP" ] && return 0
+  if [ "${UCEO_BEHIND_PROXY:-0}" = 1 ] && [ -n "$dns_ip" ]; then
+    echo "Note: $UCEO_DOMAIN points to $dns_ip, not to $UCEO_PUBLIC_IP; going on because of --behind-proxy. The proxy must pass port 80 through to this server for the certificate (with Cloudflare: \"Always Use HTTPS\" off)."
+    return 0
+  fi
+  die "$UCEO_DOMAIN points to ${dns_ip:-nothing}, not to $UCEO_PUBLIC_IP. Add a DNS A record for it and run this again — or leave out --domain to start on ${UCEO_PUBLIC_IP//./-}.sslip.io (or add --behind-proxy if a proxy such as Cloudflare's sits in front)."
+}
+check_dns
 
 # --- 2. Docker ----------------------------------------------------------------
 # Container logs kept to 5 files of 20 MB each (the default json-file grows
@@ -448,6 +466,14 @@ for _ in $(seq 1 60); do
 done
 curl -fsS --max-time 3 http://127.0.0.1:8080/auth/realms/master >/dev/null 2>&1 || die "Keycloak did not start within five minutes"
 
+# The SQL on standard input: psql fills in :'email' (quoted) there, never in -c.
+record_invite() {
+  docker exec -i uceo-postgres-1 psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q -v ON_ERROR_STOP=1 \
+    -v email="$UCEO_ADMIN_EMAIL" >/dev/null <<'SQL'
+INSERT INTO platform_admin_invites (email, invited_by) VALUES (:'email', 'installer') ON CONFLICT DO NOTHING;
+SQL
+}
+
 kc() { # script [extra docker run flags...]
   local script="$1"; shift
   docker run --rm --network host \
@@ -477,10 +503,7 @@ log "storing the licence"
 OPERATOR_PASSWORD=""
 if [ "$INSTALLED" = 0 ]; then
   log "creating the first platform operator"
-  docker exec uceo-postgres-1 psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q -v ON_ERROR_STOP=1 \
-    -v email="$UCEO_ADMIN_EMAIL" \
-    -c "INSERT INTO platform_admin_invites (email, invited_by) VALUES (:'email', 'installer') ON CONFLICT DO NOTHING" \
-    >/dev/null || die "could not record the operator invitation"
+  record_invite || die "could not record the operator invitation"
   OPERATOR_PASSWORD="$(secret 16)"
   made=$(kc bootstrap-operator.mjs -e OPERATOR_EMAIL="$UCEO_ADMIN_EMAIL" -e OPERATOR_PASSWORD="$OPERATOR_PASSWORD") \
     || die "could not create the operator's sign-in"
