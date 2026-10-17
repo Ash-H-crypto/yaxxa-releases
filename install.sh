@@ -16,10 +16,12 @@
 # (--version X.Y.Z installs a particular release instead of the latest.)
 #
 # A domain behind a proxy (Cloudflare's orange cloud) points at the proxy,
-# not at this server: add --behind-proxy (or UCEO_BEHIND_PROXY=1) and the
+# not at this server: add --behind-proxy (or UCEO_INSTALL_BEHIND_PROXY=1) and the
 # check that it points here is skipped. The certificate is still issued over
 # HTTP on port 80, so the proxy must pass port 80 through (with Cloudflare:
 # "Always Use HTTPS" off).
+#
+# --edition imara installs the Imara CX edition (UCEO_EDITION=imara in .env).
 #
 # An install code is for one server. The first install binds it to this
 # server; another server with the same code is refused. Yaxxa can release it
@@ -60,7 +62,10 @@ while [ $# -gt 0 ]; do
     --email) UCEO_ADMIN_EMAIL="${2:-}"; shift ;;
     --domain) UCEO_DOMAIN="${2:-}"; shift ;;
     --version) UCEO_VERSION_WANTED="${2:-}"; shift ;;
-    --behind-proxy) UCEO_BEHIND_PROXY=1 ;;
+    --behind-proxy) UCEO_INSTALL_BEHIND_PROXY=1 ;;
+    # The Imara CX edition, written to a NEW installation's .env before anything
+    # starts (the first server is named by the machine, not "srv-01").
+    --edition) UCEO_NEW_EDITION="${2:-}"; shift ;;
     # Where licences come from (ADR-0048): the centre's address, given in
     # the command Platform → Installs shows when it is not the default.
     --licence-url) ARG_LICENCE_URL="${2:-}"; shift ;;
@@ -215,7 +220,7 @@ check_dns() {
   local dns_ip
   dns_ip=$(getent ahostsv4 "$UCEO_DOMAIN" | awk 'NR==1 {print $1}' || true)
   [ "$dns_ip" = "$UCEO_PUBLIC_IP" ] && return 0
-  if [ "${UCEO_BEHIND_PROXY:-0}" = 1 ] && [ -n "$dns_ip" ]; then
+  if [ "${UCEO_INSTALL_BEHIND_PROXY:-0}" = 1 ] && [ -n "$dns_ip" ]; then
     echo "Note: $UCEO_DOMAIN points to $dns_ip, not to $UCEO_PUBLIC_IP; going on because of --behind-proxy. The proxy must pass port 80 through to this server for the certificate (with Cloudflare: \"Always Use HTTPS\" off)."
     return 0
   fi
@@ -318,6 +323,14 @@ chmod 755 "$DIR" "$DIR"/scripts/*.sh "$DIR"/scripts/ops/*.sh 2>/dev/null || true
 if [ "$INSTALLED" = 0 ]; then
   log "writing $ENV with new secrets"
   pg=$(secret); app=$(secret); plat=$(secret); edge=$(secret)
+  # A cloud server with no IPv6 route (AWS VPCs have none unless asked) must try
+  # IPv4 first: Cloudflare-fronted names answer with AAAA first, and Node would
+  # wait on an address it cannot reach (the API could not fetch sign-in's keys
+  # from its own public name). A server with IPv6 keeps Node's default.
+  node_dns="# NODE_OPTIONS: not needed here, this server has an IPv6 route."
+  ip -6 route show default 2>/dev/null | grep -q . \
+    || node_dns="# This server has no IPv6 route: Node tries IPv4 first (a public name behind a proxy answers AAAA first).
+NODE_OPTIONS=--dns-result-order=ipv4first"
   cat > "$ENV" <<EOF
 # Written by the installer on $(date -u '+%F %T UTC'). Every secret here was
 # generated on this server. Readable by root only; back it up with care.
@@ -327,6 +340,12 @@ API_HOST=127.0.0.1
 API_PORT=3000
 LOG_LEVEL=info
 DEPLOYMENT_TOPOLOGY=single-node
+$node_dns
+# Behind Cloudflare's proxy with the firewall open to Cloudflare alone? Set
+# UCEO_BEHIND_PROXY=1 (then recreate the web and API containers): the real
+# client address is then used for geo-blocking, rate limits and the audit log.
+# Leave it unset anywhere else: the header could be forged.
+# UCEO_BEHIND_PROXY=1
 
 PUBLIC_HOSTNAME=$UCEO_DOMAIN
 ADMIN_ALLOWED_CIDRS="$UCEO_ADMIN_CIDRS"
@@ -413,6 +432,10 @@ UCEO_AUTO_UPDATE=$([ "$L_CHANNEL" = staging ] && echo 1 || echo 0)
 # phone system go straight to it. Optional; empty: no Phone system anywhere.
 AIPBX_URL=
 EOF
+  if [ -n "${UCEO_NEW_EDITION:-}" ]; then
+    case "$UCEO_NEW_EDITION" in standard | imara) ;; *) die "--edition is standard or imara, not $UCEO_NEW_EDITION" ;; esac
+    printf 'UCEO_EDITION=%s\n' "$UCEO_NEW_EDITION" >> "$ENV"
+  fi
   chmod 600 "$ENV"
 fi
 set -a; . "$ENV"; set +a
@@ -480,7 +503,7 @@ kc() { # script [extra docker run flags...]
     -e KEYCLOAK_URL=http://127.0.0.1:8080/auth -e KEYCLOAK_ADMIN -e KEYCLOAK_ADMIN_PASSWORD \
     -e PUBLIC_BASE_URL="https://$PUBLIC_HOSTNAME" -e OIDC_AUDIENCE \
     -e GOOGLE_CLIENT_ID -e GOOGLE_CLIENT_SECRET -e MICROSOFT_CLIENT_ID -e MICROSOFT_CLIENT_SECRET \
-    -e KEYCLOAK_EXTRA_WEB_BASES \
+    -e KEYCLOAK_EXTRA_WEB_BASES -e UCEO_EDITION \
     "$@" "$UCEO_IMAGE_PREFIX/migrate:$UCEO_VERSION" node "keycloak/$script"
 }
 log "setting up sign-in"
