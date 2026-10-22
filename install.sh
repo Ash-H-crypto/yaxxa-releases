@@ -538,7 +538,7 @@ log "installing updates, licence renewal, nightly media restart, backups and the
 cp "$DIR"/infrastructure/host/uceo-*.service "$DIR"/infrastructure/host/uceo-*.timer /etc/systemd/system/
 systemctl daemon-reload
 # One at a time: a unit a release does not have must not keep the others off.
-for unit in uceo-update-agent.timer uceo-licence.timer uceo-host-agent.service uceo-restore-test.timer; do
+for unit in uceo-update-agent.timer uceo-licence.timer uceo-host-agent.service uceo-restore-test.timer uceo-walg-backup.timer uceo-backup-copy.timer uceo-pitr-drill.timer; do
   [ -f "/etc/systemd/system/$unit" ] || continue
   systemctl enable --now "$unit" >/dev/null 2>&1 || echo "Note: $unit did not start; see 'systemctl status $unit'."
 done
