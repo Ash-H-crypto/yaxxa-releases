@@ -548,10 +548,8 @@ SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Media nodes, one at a time, never over a live call.
 0 4 * * * root $DIR/scripts/fs-nightly-restart.sh >> /var/log/uceo-fs-restart.log 2>&1
-# Database, storage and settings; the newest 7 are kept.
-30 2 * * * root UCEO_ROOT=$DIR BACKUP_ROOT=/var/backups/uceo $DIR/scripts/ops/backup.sh >> /var/log/uceo-backup.log 2>&1
 EOF
-chmod 644 /etc/cron.d/uceo
+"$DIR/scripts/ops/ensure-backup-cron.sh" "$DIR"
 
 # --- 8. The firewall, and from the outside -------------------------------------
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
