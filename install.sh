@@ -37,7 +37,7 @@
 #   5. starts everything, sets up sign-in, stores the licence;
 #   6. creates the first platform operator with a one-time password;
 #   7. installs updates, licence renewal, nightly media restart and backups;
-#   8. opens the server's firewall (ufw) for the platform if it is on, and checks the
+#   8. opens the server's firewall (ufw or firewalld) for the platform if it is on, and checks the
 #      platform answers on its own address.
 #
 # Running it again on an installed server keeps its .env and secrets, and the
@@ -77,6 +77,27 @@ done
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 log() { echo "$(date '+%F %T') $*"; }
 die() { echo; printf '\033[31mStopped: %s\033[0m\n' "$*" >&2; exit 1; }
+# apt on Debian and Ubuntu, dnf on the Red Hat family (ADR-0081).
+pkg_install() {
+  if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq "$@" >/dev/null
+  else dnf install -y -q "$@" >/dev/null; fi
+}
+# firewalld (on by default on the Red Hat family) drops what our own rules let
+# in: open these ports in it, and trust this server's private networks, which
+# the servers of an installation talk over (ADR-0010). Kept across reboots.
+# Only /16 or smaller, never a VM bridge. ponytail: a provider's shared
+# private LAN is still trusted whole; narrow it to the peers if one bites.
+firewalld_open() {
+  command -v firewall-cmd >/dev/null && firewall-cmd -q --state 2>/dev/null || return 0
+  local x
+  for x in "$@"; do
+    firewall-cmd -q --add-port="$x" || true; firewall-cmd -q --permanent --add-port="$x" || true
+  done
+  for x in $(ip -4 -o addr show scope global | awk '$2 !~ /^(docker|br-|veth|virbr|podman|cni)/ { print $4 }' \
+    | python3 -c 'import ipaddress, sys; [print(n) for n in {ipaddress.ip_interface(a).network for a in sys.stdin.read().split()} if n.is_private and n.prefixlen >= 16]'); do
+    firewall-cmd -q --zone=trusted --add-source="$x" || true; firewall-cmd -q --permanent --zone=trusted --add-source="$x" || true
+  done
+}
 ask() { # variable prompt
   local var="$1" prompt="$2" v="${!1:-}"
   if [ -z "$v" ]; then
@@ -95,11 +116,14 @@ echo
 # --- 1. The machine -----------------------------------------------------------
 [ "$(id -u)" = 0 ] || die "run as root (with sudo)"
 . /etc/os-release 2>/dev/null || die "cannot tell which operating system this is"
-# Debian 13 is what Yaxxa runs itself; Ubuntu LTS works the same way.
+# Debian 13 is what Yaxxa runs itself; Ubuntu LTS works the same way. The Red
+# Hat family is set up the same way but not yet tested on a server (ADR-0081).
 case "${ID:-}:${VERSION_ID:-}" in
   debian:13|ubuntu:22.04|ubuntu:24.04) ;;
+  rhel:9*|rhel:10*|rocky:9*|rocky:10*|almalinux:9*|almalinux:10*)
+    echo "Note: ${PRETTY_NAME:-this system} is supported but not yet tested by Yaxxa; Debian 13 is recommended." ;;
   debian:*|ubuntu:*) echo "Note: tested on Debian 13 and Ubuntu 22.04/24.04; this is ${PRETTY_NAME:-unknown}." ;;
-  *) die "this installer is for Debian 13 (recommended) or Ubuntu 22.04/24.04 (found ${PRETTY_NAME:-unknown})" ;;
+  *) die "this installer is for Debian 13 (recommended), Ubuntu 22.04/24.04 or RHEL/Rocky/AlmaLinux 9/10 (found ${PRETTY_NAME:-unknown})" ;;
 esac
 mem_gb=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 / 1024 ))
 cpus=$(nproc)
@@ -110,7 +134,7 @@ echo "This server: ${cpus} CPUs, ${mem_gb} GB memory, ${disk_gb} GB free disk."
 [ "$cpus" -ge 4 ] || echo "Note: 4 or more CPUs are recommended for calls; this server has ${cpus}."
 
 for tool in curl openssl python3; do
-  command -v "$tool" >/dev/null || { apt-get update -qq && apt-get install -y -qq "$tool" >/dev/null; }
+  command -v "$tool" >/dev/null || pkg_install "$tool"
 done
 
 ENV="$DIR/.env"
@@ -254,17 +278,27 @@ if ! command -v docker >/dev/null || ! docker compose version >/dev/null 2>&1; t
   # From Docker's own repository, as on Yaxxa's servers: the distributions'
   # packages lag behind and name the compose plugin differently.
   log "installing Docker"
-  apt-get update -qq
-  apt-get install -y -qq ca-certificates curl gnupg >/dev/null
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL "https://download.docker.com/linux/$ID/gpg" -o /etc/apt/keyrings/docker.asc \
-    || die "could not fetch Docker's signing key"
-  chmod a+r /etc/apt/keyrings/docker.asc
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$ID ${VERSION_CODENAME} stable" \
-    > /etc/apt/sources.list.d/docker.list
-  apt-get update -qq
-  apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null \
-    || die "Docker could not be installed"
+  if ! command -v apt-get >/dev/null; then
+    # Rocky and AlmaLinux take Docker's CentOS repository; --allowerasing
+    # replaces the podman/runc packages that clash with containerd.io.
+    repo=centos; [ "$ID" = rhel ] && repo=rhel
+    curl -fsSL "https://download.docker.com/linux/$repo/docker-ce.repo" -o /etc/yum.repos.d/docker-ce.repo \
+      || die "could not fetch Docker's repository"
+    dnf install -y -q --allowerasing docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null \
+      || die "Docker could not be installed"
+  else
+    apt-get update -qq
+    apt-get install -y -qq ca-certificates curl gnupg >/dev/null
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL "https://download.docker.com/linux/$ID/gpg" -o /etc/apt/keyrings/docker.asc \
+      || die "could not fetch Docker's signing key"
+    chmod a+r /etc/apt/keyrings/docker.asc
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$ID ${VERSION_CODENAME} stable" \
+      > /etc/apt/sources.list.d/docker.list
+    apt-get update -qq
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null \
+      || die "Docker could not be installed"
+  fi
   systemctl enable --now docker >/dev/null
 fi
 docker info >/dev/null 2>&1 || die "Docker is installed but not running"
@@ -556,6 +590,7 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: activ
   log "opening the platform's ports in the firewall (ufw)"
   for rule in 80/tcp 443/tcp 5060/udp 5060/tcp 16384:32767/udp; do ufw allow "$rule" >/dev/null; done
 fi
+firewalld_open 80/tcp 443/tcp 5060/udp 5060/tcp 16384-32767/udp
 log "checking https://$PUBLIC_HOSTNAME"
 ok=0
 for _ in $(seq 1 24); do
